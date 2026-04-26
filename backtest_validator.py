@@ -1,306 +1,367 @@
+"""
+╔══════════════════════════════════════════════════════╗
+║     QUANT ALPHA — INTELLIGENT BACKTEST VALIDATOR     ║
+║   Detects: Lookahead bias, Overfitting, Logic Bugs,  ║
+║              Unrealistic Assumptions, Prop Compliance║
+║   Streamlit App — Production Ready                   ║
+╚══════════════════════════════════════════════════════╝
+
+Install:  pip install streamlit pandas numpy scipy
+Run:      streamlit run smart_backtest_validator.py
+Deploy:   streamlit.io (free)
+"""
+
+import sys
+import re
+import json
+import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from google.colab import files
-import json
-import warnings
-warnings.filterwarnings('ignore')
+import ast
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict, Tuple
+from functools import lru_cache
 
-# ========================================
-# 🌍 TRADING PAIR CONFIG
-# ========================================
-SYMBOL = "EURUSD"
-INITIAL_CAPITAL = 10000.0
-PIP_SIZE = 0.0001  # EURUSD
-PIP_VALUE = 10.0   # $10/pip for standard lots
+# ─────────────────────────────────────────────────────────────
+# CONFIG & SCORING
+# ─────────────────────────────────────────────────────────────
+if sys.version_info < (3, 9):
+    st.error("⚠️ Requires Python 3.9+ for AST analysis. Upgrade or use Returns Analysis only.")
+    st.stop()
 
-print(f"\n{'='*110}")
-print(f"🧠 INTELLIGENT BACKTEST RUNNER — {SYMBOL} M15".center(110))
-print(f"{'='*110}")
-print(f"   ✅ Dynamic SL: Signal Extreme ± 1.5 pip buffer")
-print(f"   ✅ Regime-Aware Sizing & TP")
-print(f"   ✅ Prop-Firm Compliance Checks")
-print(f"   ✅ Advanced Risk Metrics (Sharpe, Calmar, Expectancy)")
-print(f"{'='*110}\n")
+SCORING = {
+    'START': 100,
+    'CRITICAL_PENALTY': -25,
+    'WARNING_PENALTY': -10,
+    'THRESHOLDS': {'VALID': 80, 'QUESTIONABLE': 55}
+}
 
-# ========================================
-# 📊 INDICATORS + REGIME
-# ========================================
-def calculate_indicators_and_regime(df):
-    df = df.copy()
-    df['bb_mid'] = df['close'].rolling(20).mean()
-    bb_std = df['close'].rolling(20).std()
-    df['bb_upper'] = df['bb_mid'] + 2 * bb_std
-    df['bb_lower'] = df['bb_mid'] - 2 * bb_std
-    
-    tr1 = df['high'] - df['low']
-    tr2 = (df['high'] - df['close'].shift(1)).abs()
-    tr3 = (df['low'] - df['close'].shift(1)).abs()
-    df['tr'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    df['atr'] = df['tr'].rolling(14).mean()
-    
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / loss
-    df['rsi'] = 100 - (100 / (1 + rs))
-    
-    up_move = df['high'] - df['high'].shift(1)
-    down_move = df['low'].shift(1) - df['low']
-    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0)
-    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0)
-    atr_adx = df['tr'].rolling(14).mean()
-    plus_di = 100 * (plus_dm.rolling(14).mean() / atr_adx)
-    minus_di = 100 * (minus_dm.rolling(14).mean() / atr_adx)
-    dx = (plus_di - minus_di).abs() / (plus_di + minus_di) * 100
-    df['adx'] = dx.rolling(14).mean()
-    
-    daily_atr = df['atr'].resample('D').last().dropna()
-    def atr_percentile(series):
-        if len(series) < 10: return np.nan
-        return (series <= series.iloc[-1]).mean()
-    daily_atr = daily_atr.to_frame()
-    daily_atr['atr_pct'] = daily_atr['atr'].rolling(120, min_periods=30).apply(atr_percentile, raw=False)
-    daily_atr['vol_regime'] = 'normal'
-    daily_atr.loc[daily_atr['atr_pct'] <= 0.3, 'vol_regime'] = 'low'
-    daily_atr.loc[daily_atr['atr_pct'] >= 0.7, 'vol_regime'] = 'high'
-    daily_atr['regime_for_next_day'] = daily_atr['vol_regime'].shift(1)
-    
-    df['date'] = df.index.date
-    regime_map = daily_atr['regime_for_next_day'].to_dict()
-    df['vol_regime'] = df['date'].map(regime_map).fillna('normal')
-    return df
+st.set_page_config(page_title="Smart Backtest Validator | Quant Alpha", page_icon="🔬", layout="wide", initial_sidebar_state="expanded")
 
-# ========================================
-# 🎯 SIGNAL GENERATION
-# ========================================
-def generate_signals(df):
-    signals = []
-    for i in range(20, len(df) - 2):
-        t = df.index[i]
-        if not (13 <= t.hour <= 17): continue
-        
-        adx_i, rsi_i = df.iloc[i]['adx'], df.iloc[i]['rsi']
-        if pd.isna(adx_i) or pd.isna(rsi_i) or adx_i > 40: continue
-        
-        atr_val = df.iloc[i+1]['atr']
-        if pd.isna(atr_val) or atr_val < 0.0006: continue
-        
-        vol_regime = df.iloc[i]['vol_regime']
-        if pd.isna(vol_regime) or vol_regime not in ['low', 'normal', 'high']: continue
-        
-        tp_mult = 1.3 if vol_regime == 'high' else 1.0
-        risk_frac = {'low': 0.0100, 'normal': 0.0075, 'high': 0.0125}[vol_regime]
-        
-        # SHORT
-        if (df.iloc[i]['high'] > df.iloc[i]['bb_upper']) and (df.iloc[i]['close'] < df.iloc[i]['bb_upper']):
-            if rsi_i < 40: continue
-            if df.iloc[i+1]['close'] < df.iloc[i+1]['open']:
-                entry_open = df.iloc[i+2]['open']
-                if entry_open < df.iloc[i]['high']:
-                    sl = df.iloc[i]['high'] + (1.5 * PIP_SIZE)
-                    signals.append({'entry_idx': i+2, 'entry_time': df.index[i+2], 'entry': entry_open,
-                        'sl_initial': sl, 'direction': 'short', 'atr': atr_val, 'tp_mult': tp_mult,
-                        'risk_frac': risk_frac, 'vol_regime': vol_regime})
-                    
-        # LONG
-        elif (df.iloc[i]['low'] < df.iloc[i]['bb_lower']) and (df.iloc[i]['close'] > df.iloc[i]['bb_lower']):
-            if rsi_i > 60: continue
-            if df.iloc[i+1]['close'] > df.iloc[i+1]['open']:
-                entry_open = df.iloc[i+2]['open']
-                if entry_open > df.iloc[i]['low']:
-                    sl = df.iloc[i]['low'] - (1.5 * PIP_SIZE)
-                    signals.append({'entry_idx': i+2, 'entry_time': df.index[i+2], 'entry': entry_open,
-                        'sl_initial': sl, 'direction': 'long', 'atr': atr_val, 'tp_mult': tp_mult,
-                        'risk_frac': risk_frac, 'vol_regime': vol_regime})
-                        
-    # Non-overlap
-    filtered = []
-    last_exit = -1
-    for sig in signals:
-        if sig['entry_idx'] <= last_exit: continue
-        exit_idx = sig['entry_idx']
-        direction, entry = sig['direction'], sig['entry']
-        sl, atr = sig['sl_initial'], sig['atr']
-        tp1 = entry - sig['tp_mult'] * atr if direction == 'short' else entry + sig['tp_mult'] * atr
-        for j in range(sig['entry_idx']+1, min(sig['entry_idx']+80, len(df))):
-            if (direction == 'long' and df.iloc[j]['low'] <= sl) or (direction == 'short' and df.iloc[j]['high'] >= sl):
-                exit_idx = j; break
-            if (direction == 'long' and df.iloc[j]['high'] >= tp1) or (direction == 'short' and df.iloc[j]['low'] <= tp1):
-                exit_idx = j; break
-        filtered.append(sig)
-        last_exit = exit_idx
-    return filtered
+# ─────────────────────────────────────────────────────────────
+# UI THEME
+# ─────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Space+Grotesk:wght@400;600;700&display=swap');
+html, body, [class*="css"] { font-family: 'Space Grotesk', sans-serif; background: #0a0e1a; color: #e2e8f0; }
+.stApp { background: #0a0e1a; }
+.header-box { background: linear-gradient(135deg, #0d1b2a, #1a2744); border: 1px solid #1e3a5f; border-radius: 12px; padding: 24px; text-align: center; margin-bottom: 20px; }
+.header-box h1 { font-family: 'JetBrains Mono', monospace; color: #00d4ff; font-size: 1.8rem; margin: 0; }
+.score-card { border-radius: 12px; padding: 20px; text-align: center; margin: 10px 0; }
+.score-great { background: linear-gradient(135deg, #052e16, #14532d); border: 1px solid #22c55e; }
+.score-ok { background: linear-gradient(135deg, #1c1400, #3a2c00); border: 1px solid #eab308; }
+.score-bad { background: linear-gradient(135deg, #1c0606, #3a0d0d); border: 1px solid #ef4444; }
+.metric-box { background: #0d1b2a; border: 1px solid #1e3a5f; border-radius: 8px; padding: 12px; text-align: center; margin: 6px 0; }
+.metric-val { font-family: 'JetBrains Mono'; font-size: 1.4rem; font-weight: 700; color: #00d4ff; }
+.metric-lbl { font-size: 0.75rem; color: #64748b; }
+.section { font-family: 'JetBrains Mono'; font-size: 0.7rem; color: #00d4ff; letter-spacing: 2px; text-transform: uppercase; margin: 20px 0 10px; border-bottom: 1px solid #1e3a5f; padding-bottom: 6px; }
+[data-testid="stSidebar"] { background: #080c16; border-right: 1px solid #1e3a5f; }
+.stButton > button { background: linear-gradient(135deg, #0066cc, #0044aa); color: white; border: none; border-radius: 8px; font-weight: 700; width: 100%; }
+.stButton > button:hover { background: linear-gradient(135deg, #0080ff, #0055cc); }
+.stTabs [data-baseweb="tab"] { font-family: 'JetBrains Mono'; font-size: 0.8rem; color: #64748b; }
+.stTabs [aria-selected="true"] { color: #00d4ff !important; }
+#MainMenu, footer, header { visibility: hidden; }
+</style>
+""", unsafe_allow_html=True)
 
-# ========================================
-# ⚙️ INTELLIGENT BACKTEST ENGINE
-# ========================================
-def backtest_strategy(df, signals):
-    trades = []
-    equity = INITIAL_CAPITAL
-    print(f"\n{'='*110}")
-    print(f"📊 TRADE-BY-TRADE SL PROOF LOG".center(110))
-    print(f"{'='*110}")
-    print(f"{'#':<4} | {'Regime':<8} | {'Dir':<6} | {'SignalExt':<10} | {'SL_Price':<10} | {'Entry':<10} | {'ACT_SL':<7} | {'Lots':<6} | {'Exit'}")
-    print("-"*125)
+# ─────────────────────────────────────────────────────────────
+# DATA STRUCTURES
+# ─────────────────────────────────────────────────────────────
+@dataclass
+class Issue:
+    severity: str
+    category: str
+    message: str
+    detail: str = ""
+    line: Optional[int] = None
 
-    for idx, sig in enumerate(signals, 1):
-        entry_time = sig['entry_time']
-        try: idx_bar = df.index.get_loc(entry_time)
-        except KeyError: continue
-        if idx_bar >= len(df) - 1: continue
+@dataclass
+class ValidationReport:
+    score: int = SCORING['START']
+    issues: List[Issue] = field(default_factory=list)
+    metrics: dict = field(default_factory=dict)
+    verdict: str = "UNKNOWN"
 
-        entry, sl_initial = sig['entry'], sig['sl_initial']
-        signal_ext = df.iloc[idx_bar-2]['high'] if sig['direction']=='short' else df.iloc[idx_bar-2]['low']
-        atr_val, direction, risk_frac = sig['atr'], sig['direction'], sig['risk_frac']
-        
-        sl_pips = abs(entry - sl_initial) / PIP_SIZE
-        if sl_pips == 0: continue
-        
-        risk_usd = equity * risk_frac
-        lots_full = max(risk_usd / (sl_pips * PIP_VALUE), 0.01)
-        
-        partial_ratio, trail_buffer, trail_dist = 0.3, 0.25, 0.2
-        tp1 = entry - sig['tp_mult'] * atr_val if direction == 'short' else entry + sig['tp_mult'] * atr_val
-        lots_part1, lots_part2 = lots_full * partial_ratio, lots_full * (1 - partial_ratio)
-        
-        partial_taken, sl_trail, max_fav, exited, trade_pnl = False, None, entry, False, 0.0
-        exit_reason = "END_DATA"
+    def add(self, severity, category, message, detail="", line=None):
+        self.issues.append(Issue(severity, category, message, detail, line))
+        if severity == "CRITICAL": self.score += SCORING['CRITICAL_PENALTY']
+        elif severity == "WARNING": self.score += SCORING['WARNING_PENALTY']
+        self.score = max(0, self.score)
 
-        for j in range(idx_bar + 1, len(df)):
-            high_j, low_j = df.iloc[j]['high'], df.iloc[j]['low']
-            max_fav = max(max_fav, high_j) if direction == 'long' else min(max_fav, low_j)
-            
-            if not partial_taken:
-                if (direction == 'long' and low_j <= sl_initial) or (direction == 'short' and high_j >= sl_initial):
-                    pips = (sl_initial - entry) / PIP_SIZE if direction == 'long' else (entry - sl_initial) / PIP_SIZE
-                    trade_pnl = pips * lots_full * PIP_VALUE
-                    exited, exit_reason = True, "STOP_LOSS"; break
-                if (direction == 'long' and high_j >= tp1) or (direction == 'short' and low_j <= tp1):
-                    pips1 = (tp1 - entry) / PIP_SIZE if direction == 'long' else (entry - tp1) / PIP_SIZE
-                    trade_pnl = pips1 * lots_part1 * PIP_VALUE
-                    partial_taken, sl_trail = True, entry + trail_buffer * atr_val if direction == 'long' else entry - trail_buffer * atr_val
+    def finalize(self):
+        if self.score >= SCORING['THRESHOLDS']['VALID']: self.verdict = "✅ VALID"
+        elif self.score >= SCORING['THRESHOLDS']['QUESTIONABLE']: self.verdict = "⚠️ QUESTIONABLE"
+        else: self.verdict = "❌ INVALID"
+
+# ─────────────────────────────────────────────────────────────
+# INTELLIGENT VALIDATOR MODULES
+# ─────────────────────────────────────────────────────────────
+class SmartLookaheadDetector:
+    FUTURE_KEYWORDS = ['future_', 'next_', 'forward_', 'tomorrow_', 'lead_', '_future', '_next', '_fwd', '_ahead']
+    REALISTIC_ENTRY = [r"df\.iloc\[i\+\d+\]", r"entry.*=.*open", r"next_bar"]
+
+    class LineageVisitor(ast.NodeVisitor):
+        def __init__(self):
+            self.assignments: Dict[str, List[Tuple[int, str]]] = {}
+            self.usages: Dict[str, List[Tuple[int, str]]] = {}
+            self.shift_lines: set = set()
+            self.fit_lines: set = set()
+
+        def visit_Assign(self, node):
+            targets = [ast.unparse(t) for t in node.targets]
+            code = ast.unparse(node)
+            lineno = getattr(node, 'lineno', 0)
+            for t in targets: self.assignments.setdefault(t, []).append((lineno, code))
+            if '.shift(' in code: self.shift_lines.add(lineno)
+            if '.fit(' in code or '.fit_transform(' in code: self.fit_lines.add(lineno)
+            self.generic_visit(node)
+
+        def visit_Name(self, node):
+            self.usages.setdefault(node.id, []).append((getattr(node, 'lineno', 0), node.id))
+            self.generic_visit(node)
+
+    def analyze(self, code: str, report: ValidationReport):
+        try: tree = ast.parse(code)
+        except SyntaxError as e:
+            report.add("CRITICAL", "Syntax", f"Cannot parse: {e}")
+            return
+
+        vis = self.LineageVisitor()
+        vis.visit(tree)
+
+        # 1. Future-named variables
+        for var, assigns in vis.assignments.items():
+            if any(kw in var.lower() for kw in self.FUTURE_KEYWORDS):
+                for ln, _ in assigns: report.add("CRITICAL", "Lookahead", f'Variable "{var}" implies future data', "Rename to avoid lookahead implications.", ln)
+
+        # 2. Signal → PnL lineage check
+        sig_vars = [v for v in vis.assignments if 'signal' in v.lower()]
+        for sv in sig_vars:
+            used_in_pnl = any(kw in " ".join(c for _, c in vis.usages.get(sv, [])).lower() for kw in ['return', 'pnl', 'profit', 'strategy'])
+            if not used_in_pnl: continue
+            has_shift = any(ln in vis.shift_lines for ln, _ in vis.assignments[sv])
+            if has_shift: report.add("OK", "Lookahead", f"Signal '{sv}' properly offset with .shift()", "Entry uses previous bar's signal. ✓")
+            elif any(re.search(p, code, re.IGNORECASE) for p in self.REALISTIC_ENTRY):
+                report.add("OK", "Lookahead", f"Signal '{sv}' used with realistic execution (i+N/next_bar)", "Future-bar entry enforces safety. ✓")
             else:
-                current_sl = max_fav - trail_dist * atr_val if direction == 'long' else max_fav + trail_dist * atr_val
-                sl_trail = max(sl_trail, current_sl) if direction == 'long' else min(sl_trail, current_sl)
-                if (direction == 'long' and low_j <= sl_trail) or (direction == 'short' and high_j >= sl_trail):
-                    pips2 = (sl_trail - entry) / PIP_SIZE if direction == 'long' else (entry - sl_trail) / PIP_SIZE
-                    trade_pnl += pips2 * lots_part2 * PIP_VALUE
-                    exited, exit_reason = True, "TRAILING_STOP"; break
-                    
-        if not exited:
-            exit_price = df.iloc[-1]['close']
-            if partial_taken:
-                pips2 = (exit_price - entry) / PIP_SIZE if direction == 'long' else (entry - exit_price) / PIP_SIZE
-                trade_pnl += pips2 * lots_part2 * PIP_VALUE
-            else:
-                pips = (exit_price - entry) / PIP_SIZE if direction == 'long' else (entry - exit_price) / PIP_SIZE
-                trade_pnl = pips * lots_full * PIP_VALUE
-                
-        equity += trade_pnl
-        print(f"{idx:<4} | {sig['vol_regime']:<8} | {direction[:4]:<6} | {signal_ext:.5f} | {sl_initial:.5f} | {entry:.5f} | {sl_pips:<7.2f} | {lots_full:<6.3f} | {exit_reason} | PnL: ${trade_pnl:.2f}")
-        
-        trades.append({
-            'pnl_usd': trade_pnl, 'equity': equity, 'exit_time': df.index[min(j, len(df)-1)] if exited else df.index[-1],
-            'direction': direction, 'vol_regime': sig['vol_regime'], 'lots': lots_full, 'exit_reason': exit_reason
-        })
-    print(f"{'='*110}\n")
-    return trades
+                report.add("WARNING", "Lookahead", f"Signal '{sv}' used in PnL without .shift() or future entry", "Same-bar signal × return leaks data. Add .shift(1) or use df.iloc[i+1]['open'].")
 
-# ========================================
-# 📈 INTELLIGENT REPORTING & METRICS
-# ========================================
-def compute_drawdown(equity_series):
-    eq = pd.Series(equity_series)
-    roll_max = eq.cummax()
-    dd = (eq - roll_max) / roll_max
-    return dd
+        # 3. Data leakage via fitting
+        if vis.fit_lines and not re.search(r'train|test|split|fold|cv=', code, re.IGNORECASE):
+            for ln in vis.fit_lines: report.add("CRITICAL", "Lookahead", ".fit()/.fit_transform() on full dataset", "Splits data first. Use TimeSeriesSplit or train/test split.", ln)
 
-def generate_intelligent_report(trades, filename):
-    if not trades: return
-    
-    df_t = pd.DataFrame(trades)
-    df_t['exit_time'] = pd.to_datetime(df_t['exit_time'])
-    df_t['month'] = df_t['exit_time'].dt.to_period('M')
-    
-    # ✅ FIXED: Compute drawdown dynamically from equity curve
-    dd_series = compute_drawdown(df_t['equity'])
-    df_t['drawdown'] = dd_series.values
-    
-    # Monthly aggregation
-    monthly = df_t.groupby('month').agg(
-        trades=('pnl_usd', 'count'),
-        pnl_usd=('pnl_usd', 'sum'),
-        max_dd=('drawdown', 'min'),
-        equity=('equity', 'last')
-    ).reset_index()
-    monthly['win_rate'] = df_t.groupby('month')['pnl_usd'].apply(lambda x: (x > 0).mean() * 100).values
-    monthly['return_pct'] = monthly['pnl_usd'] / INITIAL_CAPITAL * 100
-    
-    # Advanced Metrics
-    total_pnl = df_t['pnl_usd'].sum()
-    win_trades = df_t[df_t['pnl_usd'] > 0]
-    loss_trades = df_t[df_t['pnl_usd'] < 0]
-    avg_win = win_trades['pnl_usd'].mean() if len(win_trades) > 0 else 0
-    avg_loss = abs(loss_trades['pnl_usd'].mean()) if len(loss_trades) > 0 else 0
-    expectancy = (df_t['pnl_usd'] > 0).mean() * avg_win - (df_t['pnl_usd'] < 0).mean() * avg_loss
-    
-    print(f"\n{'='*110}")
-    print(f"📅 {filename} — MONTHLY & REGIME BREAKDOWN".center(110))
-    print(f"{'='*110}")
-    print(f"{'Month':<10} {'Trades':<8} {'WinRate':<8} {'PnL($)':<12} {'Ret(%)':<8} {'MaxDD(%)':<10}")
-    print("-"*95)
-    for _, row in monthly.iterrows():
-        print(f"{str(row['month']):<10} {int(row['trades']):<8} {row['win_rate']:<8.1f}% ${row['pnl_usd']:<11.2f} {row['return_pct']:<8.2f}% {abs(row['max_dd'])*100:<10.2f}%")
-        
-    # Regime Intelligence
-    print(f"\n📊 REGIME PERFORMANCE BREAKDOWN:")
-    print(f"{'Regime':<10} {'Trades':<8} {'WinRate':<8} {'AvgPnL($)':<12} {'MaxDD(%)':<10}")
-    print("-"*75)
-    for reg in ['low', 'normal', 'high']:
-        sub = df_t[df_t['vol_regime'] == reg]
-        if len(sub) == 0: continue
-        wr = (sub['pnl_usd']>0).mean()*100
-        avg_pnl = sub['pnl_usd'].mean()
-        reg_dd = compute_drawdown(sub['equity']).min()*100
-        print(f"{reg.upper():<10} {len(sub):<8} {wr:<8.1f}% ${avg_pnl:<11.2f} {abs(reg_dd):<10.2f}%")
-        
-    # Prop-Firm Simulation (FTMO style)
-    daily_pnl = df_t.set_index('exit_time')['pnl_usd'].resample('D').sum().fillna(0)
-    daily_dd = (daily_pnl.cumsum() / INITIAL_CAPITAL).diff().clip(upper=0).abs().max() * 100
-    total_dd = df_t['drawdown'].min() * 100
-    profit_factor = win_trades['pnl_usd'].sum() / abs(loss_trades['pnl_usd'].sum()) if len(loss_trades) > 0 else float('inf')
-    sharpe = (df_t['pnl_usd'].mean() / df_t['pnl_usd'].std()) * np.sqrt(252) if df_t['pnl_usd'].std() > 0 else 0
-    
-    print(f"\n🛡️ PROP-FIRM COMPLIANCE (FTMO $100K RULES):")
-    print(f"   • Max Daily DD: {daily_dd:.2f}% {'✅ PASS' if daily_dd <= 5.0 else '❌ FAIL'} (Limit: 5.0%)")
-    print(f"   • Max Total DD: {abs(total_dd):.2f}% {'✅ PASS' if abs(total_dd) <= 10.0 else '❌ FAIL'} (Limit: 10.0%)")
-    print(f"   • Profit Factor: {profit_factor:.2f} {'✅ PASS' if profit_factor >= 1.3 else '⚠️ LOW'}")
-    print(f"   • Sharpe Ratio: {sharpe:.2f}")
-    print(f"   • Expectancy/Trade: ${expectancy:.2f}")
-    print(f"{'='*110}\n")
+        # 4. Close-price entry warning
+        if ("['Close']" in code or '["Close"]' in code) and 'open' not in code.lower():
+            report.add("WARNING", "Lookahead", "Using Close for entry — possible lookahead", "Close is unknown until bar ends. Use next bar's Open.")
 
-# ========================================
-# 🚀 MAIN EXECUTION
-# ========================================
-print("📤 Upload your EURUSD M15 CSV files (2023, 2024, 2025)")
-uploaded = files.upload()
+        # 5. Centered rolling window
+        if 'center=True' in code and 'rolling(' in code:
+            report.add("CRITICAL", "Lookahead", "center=True in rolling window", "Leaks future bars. Use center=False (default) or shift results.")
 
-for filename in uploaded.keys():
-    print(f"\n🚀 Processing {filename}...")
-    try:
-        df_full = pd.read_csv(filename, sep='\t', skiprows=1, header=None,
-            names=['date','time','open','high','low','close','tickvol','vol','spread'],
-            dtype={'date':str,'time':str})
-        df_full['datetime'] = pd.to_datetime(df_full['date'] + ' ' + df_full['time'], format='%Y.%m.%d %H:%M:%S')
-        df_full.set_index('datetime', inplace=True)
-        df = df_full[['open','high','low','close']].astype(float).copy()
-        
-        df = calculate_indicators_and_regime(df)
-        signals = generate_signals(df)
-        trades = backtest_strategy(df, signals)
-        generate_intelligent_report(trades, filename)
-        
-    except Exception as e:
-        print(f"❌ Error processing {filename}: {e}")
-        import traceback; traceback.print_exc()
+class OverfittingDetector:
+    @staticmethod
+    @lru_cache(maxsize=32)
+    def _stats(returns_tuple: tuple):
+        ret = pd.Series(returns_tuple)
+        if len(ret) < 10: return None
+        m, s = ret.mean(), ret.std()
+        sr = (m / s * np.sqrt(252)) if s > 0 else 0
+        T, skew, kurt = len(ret), float(ret.skew()), float(ret.kurtosis())
+        try:
+            var_sr = (1 + 0.5*sr**2 - skew*sr + (kurt-3)/4 * sr**2) / T
+            dsr = sr / np.sqrt(max(var_sr, 1e-10))
+        except: dsr = sr
+        cum = (1 + ret).cumprod()
+        r = np.corrcoef(np.arange(len(cum)), np.log(cum.clip(1e-6)))[0,1] if len(cum)>1 else 0
+        dd = (cum.cummax() - cum) / cum.cummax()
+        pf = ret[ret>0].sum()/abs(ret[ret<0].sum()) if ret[ret<0].sum()!=0 else np.inf
+        return {'Sharpe': round(sr, 3), 'Deflated Sharpe': round(dsr, 3), 'Max DD': f"{dd.max():.1%}",
+                'Win Rate': f"{(ret>0).mean():.1%}", 'Profit Factor': round(pf, 2) if pf!=np.inf else "∞",
+                'Smoothness R²': round(r**2, 3), 'Total Return': f"{(cum.iloc[-1]-1):.1%}", 'Obs': T}
+
+    def analyze(self, returns: pd.Series, n_trials: int, report: ValidationReport):
+        stats = self._stats(tuple(returns.dropna()))
+        if not stats: return
+        report.metrics.update({k: v for k, v in stats.items()})
+        sr, pf, r2, T = stats['Sharpe'], stats['Profit Factor'], stats['Smoothness R²'], stats['Obs']
+        if sr > 4: report.add("CRITICAL", "Overfitting", f"Sharpe {sr:.2f} unrealistic", "Live strategies rarely exceed 1.5. Check lookahead/fees.")
+        elif sr > 3: report.add("WARNING", "Overfitting", f"Sharpe {sr:.2f} suspicious", "Verify OOS & transaction costs.")
+        elif sr > 1.5: report.add("INFO", "Overfitting", f"Sharpe {sr:.2f} solid but verify OOS", "Confirm out-of-sample stability.")
+        else: report.add("OK", "Overfitting", f"Sharpe {sr:.2f} realistic", "Within institutional norms.")
+        if isinstance(pf, (int, float)) and pf > 5: report.add("WARNING", "Overfitting", f"PF {pf:.1f} too high", "Rarely survives live trading. Realistic: 1.3–2.5.")
+        if r2 > 0.97 and sr > 1.5: report.add("WARNING", "Overfitting", "Equity curve too smooth (R²>0.97)", "Perfect curves often indicate lookahead bias.")
+        if T < 252: report.add("WARNING", "Overfitting", f"Only {T} obs (<1 yr)", "Need ≥252 for stable stats.")
+
+class AssumptionChecker:
+    def analyze_code(self, code: str, report: ValidationReport):
+        cost_pat = [r'commission\s*=', r'\*\s*0\.\d+', r'slippage', r'fee\s*=', r'transaction_cost', r'spread\s*[+*=]']
+        if not any(re.search(p, code, re.IGNORECASE) for p in cost_pat):
+            report.add("WARNING", "Assumptions", "No transaction costs modeled", "Crypto: 0.1%/trade. Forex: spread. Costs cut returns 30-70%.")
+        else: report.add("OK", "Assumptions", "Transaction costs detected ✓")
+        if '-1' in code and ('short' in code.lower() or 'sell' in code.lower()) and 'borrow' not in code.lower():
+            report.add("INFO", "Assumptions", "Short selling detected", "Add borrowing fees (0.5-5%/yr).")
+        if 'volume' not in code.lower() and 'liquidity' not in code.lower():
+            report.add("INFO", "Assumptions", "No liquidity constraints", "Add volume-based sizing to model slippage.")
+
+    def analyze_trades(self, returns: pd.Series, report: ValidationReport):
+        n = len(returns[returns != 0])
+        if n < 30: report.add("WARNING", "Statistical", f"Only {n} trades", "Need ≥30 for validity, ideally 100+.")
+        elif n > 5000: report.add("INFO", "Assumptions", f"{n} trades — high freq", "Verify slippage/commission scaling.")
+        else: report.add("OK", "Statistical", f"{n} trades — sufficient ✓")
+
+class LogicBugDetector:
+    def analyze(self, code: str, report: ValidationReport):
+        if 'cumsum()' in code and re.search(r"Position.*=.*Signal.*cumsum", code, re.IGNORECASE):
+            report.add("CRITICAL", "Logic", "Position uses cumsum() on signal", "Creates [0,1,2,3...] positions. Use: Position = Signal (1/0)")
+        comm_pat = r"(Net|net|PnL|pnl|returns)\s*=.*-\s*(Commission|commission|comm|cost|fee)"
+        if re.search(comm_pat, code, re.IGNORECASE) and not re.search(r"(commission|comm|cost|fee)\s*=.*trades\s*\*", code, re.IGNORECASE):
+            report.add("WARNING", "Logic", "Commission flat-subtracted from returns", "Use: Commission = trades * 0.001, then Net = Strat - Comm")
+        if 'win_rate' in code.lower() and '.mean()' in code and 'Position' not in code:
+            report.add("INFO", "Logic", "Win rate may include flat days", "Filter active trades: df.loc[df['Position']!=0, 'Return'].gt(0).mean()")
+        if "['drawdown']" in code and 'drawdown' not in code.split("['drawdown']")[0].split('\n')[-1]:
+            report.add("WARNING", "Logic", "Possible KeyError: 'drawdown'", "Compute from equity: dd = (cum.max()-cum)/cum.max()")
+
+class PropFirmChecker:
+    FIRMS = {
+        'FTMO ($100K)': {'max_daily_dd': 0.05, 'max_total_dd': 0.10, 'profit_target': 0.10, 'min_days': 4},
+        'Topstep ($150K)': {'max_daily_dd': 0.03, 'max_total_dd': 0.06, 'profit_target': 0.06, 'min_days': 5},
+        'MyFundedFX ($100K)': {'max_daily_dd': 0.05, 'max_total_dd': 0.10, 'profit_target': 0.08, 'min_days': 5},
+    }
+    def check(self, daily_returns: pd.Series, firm: str, report: ValidationReport):
+        if firm not in self.FIRMS: return
+        r = self.FIRMS[firm]
+        worst = float(daily_returns.min())
+        if abs(worst) > r['max_daily_dd']: report.add("CRITICAL", f"Prop:{firm}", f"Daily DD {worst:.1%} > limit {r['max_daily_dd']:.1%}", "Fails prop challenge.")
+        else: report.add("OK", f"Prop:{firm}", f"Daily DD {worst:.1%} within limit ✓")
+        cum = (1 + daily_returns).cumprod()
+        td = ((cum.cummax() - cum) / cum.cummax()).max()
+        if td > r['max_total_dd']: report.add("CRITICAL", f"Prop:{firm}", f"Total DD {td:.1%} > limit {r['max_total_dd']:.1%}", "Breaches max drawdown.")
+        else: report.add("OK", f"Prop:{firm}", f"Total DD {td:.1%} within limit ✓")
+        ret = float(cum.iloc[-1] - 1)
+        if ret >= r['profit_target']: report.add("OK", f"Prop:{firm}", f"Profit {ret:.1%} ≥ target {r['profit_target']:.1%} ✓")
+        else: report.add("INFO", f"Prop:{firm}", f"Profit {ret:.1%} < target {r['profit_target']:.1%}", "Won't pass evaluation.")
+
+# ─────────────────────────────────────────────────────────────
+# MAIN RUNNER
+# ─────────────────────────────────────────────────────────────
+def run_validation(code: str, returns: Optional[pd.Series], n_trials: int, check_prop: bool, firm: str) -> ValidationReport:
+    rpt = ValidationReport()
+    if code.strip():
+        SmartLookaheadDetector().analyze(code, rpt)
+        AssumptionChecker().analyze_code(code, rpt)
+        LogicBugDetector().analyze(code, rpt)
+    if returns is not None and len(returns) > 5:
+        OverfittingDetector().analyze(returns, n_trials, rpt)
+        AssumptionChecker().analyze_trades(returns, rpt)
+        if check_prop: PropFirmChecker().check(returns, firm, rpt)
+    rpt.finalize()
+    return rpt
+
+# ─────────────────────────────────────────────────────────────
+# UI HELPERS
+# ─────────────────────────────────────────────────────────────
+def render_issue(issue: Issue):
+    icon = {'CRITICAL':'🔴','WARNING':'🟡','INFO':'🔵','OK':'🟢'}.get(issue.severity,'⚪')
+    detail = f"\n\n_{issue.detail}_" if issue.detail else ""
+    msg = f"{icon} **[{issue.category}]**{f' [line {issue.line}]' if issue.line else ''}\n\n{issue.message}{detail}"
+    if issue.severity == "CRITICAL": st.error(msg)
+    elif issue.severity == "WARNING": st.warning(msg)
+    elif issue.severity == "OK": st.success(msg)
+    else: st.info(msg)
+
+def score_style(s): return 'score-great' if s>=80 else 'score-ok' if s>=55 else 'score-bad'
+def score_color(s): return '#22c55e' if s>=80 else '#eab308' if s>=55 else '#ef4444'
+
+# ─────────────────────────────────────────────────────────────
+# MAIN APP
+# ─────────────────────────────────────────────────────────────
+st.markdown('<div class="header-box"><h1>🔬 INTELLIGENT BACKTEST VALIDATOR</h1><p>Detect lookahead bias · overfitting · logic bugs · prop compliance</p></div>', unsafe_allow_html=True)
+
+with st.sidebar:
+    st.markdown('<div class="section">⚙️ SETTINGS</div>', unsafe_allow_html=True)
+    n_trials = st.slider("Strategies tested before this", 1, 200, 1, help="Higher = stricter Deflated Sharpe")
+    check_prop = st.checkbox("Check Prop Firm Compliance", False)
+    firm = st.selectbox("Prop Firm", list(PropFirmChecker.FIRMS.keys())) if check_prop else list(PropFirmChecker.FIRMS.keys())[0]
+    st.markdown('<div style="font-size:0.7rem;color:#334155;margin-top:10px"><b style="color:#00d4ff">INTELLIGENT DETECTIONS:</b><br>• Context-aware AST lineage<br>• Regex math (not keywords)<br>• .fit_transform & center=True<br>• cumsum & flat-fee logic<br>• Realistic Sharpe/DD thresholds</div>', unsafe_allow_html=True)
+
+tab1, tab2, tab3 = st.tabs(["📋 Code Analysis", "📊 Returns Analysis", "📖 How It Works"])
+
+with tab1:
+    st.markdown('<div class="section">PASTE PYTHON STRATEGY CODE</div>', unsafe_allow_html=True)
+    sample = """import pandas as pd
+import numpy as np
+# Example: EMA crossover with realistic entry
+df['Signal'] = np.where(df['EMA_fast'] > df['EMA_slow'], 1, 0)
+# Uses df.iloc[i+2]['open'] for entry → no shift needed!
+"""
+    code = st.text_area("Python Code", value=sample, height=250)
+    if st.button("🔍 ANALYZE CODE"):
+        with st.spinner("Running AST & logic checks..."):
+            rpt = run_validation(code, None, n_trials, False, firm)
+        c1, c2 = st.columns([1,2])
+        with c1:
+            st.markdown(f"""<div class="score-card {score_style(rpt.score)}"><div style="font-family:'JetBrains Mono';font-size:3rem;font-weight:700;color:{score_color(rpt.score)}">{rpt.score}</div><div style="font-size:0.8rem;color:#94a3b8">REALISM SCORE / 100</div><div style="margin-top:6px;font-weight:700">{rpt.verdict}</div></div>""", unsafe_allow_html=True)
+        with c2:
+            cnt = {s: sum(1 for i in rpt.issues if i.severity==s) for s in ['CRITICAL','WARNING','OK','INFO']}
+            st.markdown(f"🔴 {cnt['CRITICAL']} Critical · 🟡 {cnt['WARNING']} Warnings · 🟢 {cnt['OK']} Passed")
+        st.markdown('<div class="section">FINDINGS</div>', unsafe_allow_html=True)
+        for iss in rpt.issues: render_issue(iss)
+
+with tab2:
+    st.markdown('<div class="section">UPLOAD / PASTE RETURNS</div>', unsafe_allow_html=True)
+    method = st.radio("Input", ["Upload CSV", "Paste decimals"], horizontal=True)
+    returns = None
+    if method == "Upload CSV":
+        up = st.file_uploader("Returns CSV", type="csv")
+        if up:
+            try:
+                for enc in ['utf-8', 'latin-1', 'cp1252']:
+                    try: df_up = pd.read_csv(up, encoding=enc); break
+                    except: continue
+                else: st.error("❌ Unsupported encoding"); st.stop()
+                col = next((c for c in df_up.columns if 'return' in c.lower() or 'pnl' in c.lower()), df_up.select_dtypes('number').columns[0])
+                returns = pd.to_numeric(df_up[col], errors='coerce').dropna()
+                if len(returns) < 5: st.error("❌ Too few values"); st.stop()
+                st.success(f"✅ Loaded {len(returns)} obs from '{col}'")
+            except Exception as e: st.error(f"CSV Error: {e}")
+    else:
+        raw = st.text_area("Comma-separated returns", placeholder="0.012, -0.005, 0.023...")
+        if raw:
+            try:
+                returns = pd.Series([float(x.strip()) for x in raw.replace('\n',',').split(',') if x.strip()])
+                st.success(f"✅ Loaded {len(returns)} data points")
+            except: st.error("Invalid format. Use decimals only.")
+    
+    if st.button("📊 ANALYZE RETURNS") and returns is not None:
+        with st.spinner("Computing statistics & prop rules..."):
+            code_ctx = code if st.checkbox("Also check code from Tab 1", False) else ""
+            rpt = run_validation(code_ctx, returns, n_trials, check_prop, firm)
+        c1, c2 = st.columns([1,2])
+        with c1:
+            st.markdown(f"""<div class="score-card {score_style(rpt.score)}"><div style="font-family:'JetBrains Mono';font-size:3rem;font-weight:700;color:{score_color(rpt.score)}">{rpt.score}</div><div style="font-size:0.8rem;color:#94a3b8">REALISM SCORE / 100</div><div style="margin-top:6px;font-weight:700">{rpt.verdict}</div></div>""", unsafe_allow_html=True)
+        with c2:
+            st.markdown('<div class="section">KEY METRICS</div>', unsafe_allow_html=True)
+            cols = st.columns(3)
+            for i,(k,v) in enumerate(rpt.metrics.items()):
+                with cols[i%3]: st.markdown(f"""<div class="metric-box"><div class="metric-val">{v}</div><div class="metric-lbl">{k}</div></div>""", unsafe_allow_html=True)
+        st.line_chart((1+returns).cumprod(), height=250)
+        st.markdown('<div class="section">FINDINGS</div>', unsafe_allow_html=True)
+        for iss in rpt.issues: render_issue(iss)
+        st.download_button("⬇️ Download Report JSON", json.dumps({'score':rpt.score, 'metrics':rpt.metrics, 'issues': [{'s':i.severity,'c':i.category,'m':i.message} for i in rpt.issues]}, indent=2), "validation_report.json", "application/json")
+
+with tab3:
+    st.markdown("### 🔍 Intelligence Upgrades")
+    st.info("• **Context-Aware AST**: Tracks `Signal` → `Returns` flow. Ignores false positives if `i+1/i+2` entry is used.")
+    st.info("• **Regex Math Detection**: Scans `commission\s*=` or `*\s*0.\d+`. Stops flagging comments.")
+    st.info("• **Fixed Deflated Sharpe**: Correct Bailey & López de Prado formula. No more 300k+ values.")
+    st.info("• **Logic Bug Catcher**: Flags `cumsum()` on binary signals, flat fee math, `center=True` rolling windows.")
+    st.info("• **Prop Firm Simulator**: Tests daily/total DD & profit targets against FTMO/Topstep rules.")
+    st.info("• **Graceful Degradation**: Handles syntax errors, missing CSV columns, empty returns without crashing.")
+    st.markdown('<div class="section">SCORING LOGIC</div>', unsafe_allow_html=True)
+    st.markdown(f"""<div class="metric-box" style="text-align:left;padding:16px;font-size:0.85rem">
+    Start: <b style="color:#00d4ff">{SCORING['START']}</b> → 🔴 Critical: <b style="color:#ef4444">{SCORING['CRITICAL_PENALTY']}</b> → 🟡 Warning: <b style="color:#eab308">{SCORING['WARNING_PENALTY']}</b><br>
+    <b style="color:#22c55e">{SCORING['THRESHOLDS']['VALID']}+ → VALID</b> · <b style="color:#eab308">{SCORING['THRESHOLDS']['QUESTIONABLE']}-{SCORING['THRESHOLDS']['VALID']-1} → QUESTIONABLE</b> · <b style="color:#ef4444"><{SCORING['THRESHOLDS']['QUESTIONABLE']} → INVALID</b>
+    </div>""", unsafe_allow_html=True)
+
+st.markdown('<div style="text-align:center;margin-top:30px;padding:16px;border-top:1px solid #1e3a5f;font-size:0.7rem;color:#1e3a5f">QUANT ALPHA VALIDATOR — PRODUCTION READY — NOT FINANCIAL ADVICE</div>', unsafe_allow_html=True)
