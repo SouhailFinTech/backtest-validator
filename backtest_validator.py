@@ -1,14 +1,13 @@
 """
 ╔══════════════════════════════════════════════════════╗
-║     QUANT ALPHA — INSTITUTIONAL VALIDATOR v3.4       ║
+║     QUANT ALPHA — INSTITUTIONAL VALIDATOR v3.5       ║
 ║     Founder: Hrich Souhail                           ║
-║   Fixes: DSR explosion, NumPy dropna, State persist  ║
-║   Features: Monte Carlo, DSR, Waitlist Integration   ║
+║   Features: DSR, Monte Carlo, Email Waitlist Alerts  ║
 ║   Streamlit App — Production Ready                   ║
 ╚══════════════════════════════════════════════════════╝
 
-Install:  pip install streamlit pandas numpy scipy
-Run:      streamlit run quant_alpha_v3.4.py
+Install:  pip install streamlit pandas numpy scipy requests
+Run:      streamlit run quant_alpha_v3.5.py
 Deploy:   streamlit.io (free)
 """
 
@@ -16,6 +15,7 @@ import sys
 import re
 import json
 import os
+import requests
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -76,7 +76,6 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; background: linea
 .issue-warning  { background: rgba(225, 112, 85, 0.15); border-left-color: #fdcb6e; }
 .issue-info     { background: rgba(79, 172, 254, 0.15); border-left-color: #4facfe; }
 .issue-ok       { background: rgba(0, 184, 148, 0.15); border-left-color: #55efc4; }
-.waitlist-box { background: rgba(15, 23, 42, 0.6); border: 1px solid rgba(79, 172, 254, 0.3); border-radius: 12px; padding: 16px; margin-top: 20px; }
 #MainMenu, footer, header { visibility: hidden; }
 </style>
 """, unsafe_allow_html=True)
@@ -159,17 +158,16 @@ class OverfittingDetector:
         sr = (m / s * np.sqrt(252)) if s > 0 else 0
         T, skew, kurt = len(ret), float(ret.skew()), float(ret.kurtosis())
         
-        # 🔧 ROBUST DSR FIX: Prevents explosion & division-by-zero
         try:
             var_sr = (1 + 0.5*sr**2 - skew*sr + (kurt-3)/4 * sr**2) / T
-            var_sr = max(var_sr, 1e-6)  # Floor variance
+            var_sr = max(var_sr, 1e-6)
             if n_trials <= 1:
                 dsr = sr / np.sqrt(var_sr)
             else:
                 dsr = sr / (np.sqrt(var_sr) * np.sqrt(np.log(n_trials) + 1e-10))
-            dsr = np.clip(dsr, -10, 10)  # Cap explosive values
+            dsr = np.clip(dsr, -10, 10)
         except:
-            dsr = sr if s > 0 else 0  # Safe fallback
+            dsr = sr if s > 0 else 0
             
         cum = (1 + ret).cumprod()
         r = np.corrcoef(np.arange(len(cum)), np.log(cum.clip(1e-6)))[0,1] if len(cum)>1 else 0
@@ -249,6 +247,33 @@ def run_validation(code: str, returns: Optional[pd.Series], n_trials: int, check
     rpt.finalize(); return rpt
 
 # ─────────────────────────────────────────────────────────────
+# WAITLIST & EMAIL NOTIFICATION
+# ─────────────────────────────────────────────────────────────
+def save_to_waitlist(email, name, role):
+    os.makedirs("data", exist_ok=True)
+    df = pd.DataFrame([{"name": name, "email": email, "role": role, "timestamp": pd.Timestamp.now()}])
+    path = "data/waitlist.csv"
+    df.to_csv(path, mode="a", header=not os.path.exists(path), index=False)
+    
+    # 🔔 Email Notification via Resend (Free Tier: 100/day)
+    try:
+        api_key = os.getenv("RESEND_API_KEY")
+        if api_key:
+            requests.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "from": "Quant Alpha <onboarding@resend.dev>",
+                    "to": ["hrich.souhail5@gmail.com"], # ⬅️ REPLACE WITH YOUR EMAIL
+                    "subject": f"🚀 New Waitlist Signup: {name}",
+                    "html": f"<b>{name}</b> ({email}) joined as <i>{role}</i><br><small>{pd.Timestamp.now()}</small>"
+                },
+                timeout=5
+            )
+    except Exception:
+        pass # Fails silently so UX isn't broken
+
+# ─────────────────────────────────────────────────────────────
 # UI HELPERS
 # ─────────────────────────────────────────────────────────────
 def render_issue(issue: Issue):
@@ -259,18 +284,9 @@ def render_issue(issue: Issue):
 def score_style(s): return 'score-great' if s>=80 else 'score-ok' if s>=55 else 'score-bad'
 
 # ─────────────────────────────────────────────────────────────
-# WAITLIST HANDLER
-# ─────────────────────────────────────────────────────────────
-def save_to_waitlist(email, name, role):
-    os.makedirs("data", exist_ok=True)
-    df = pd.DataFrame([{"name": name, "email": email, "role": role, "timestamp": pd.Timestamp.now()}])
-    path = "data/waitlist.csv"
-    df.to_csv(path, mode="a", header=not os.path.exists(path), index=False)
-
-# ─────────────────────────────────────────────────────────────
 # MAIN APP
 # ─────────────────────────────────────────────────────────────
-st.markdown('''<div class="header-box"><h1>🔬 QUANT ALPHA VALIDATOR v3.4</h1><p>Lookahead Bias • Parameter Sensitivity (DSR) • Monte Carlo Risk</p><div class="founder-tag">Founder: Hrich Souhail</div></div>''', unsafe_allow_html=True)
+st.markdown('''<div class="header-box"><h1>🔬 QUANT ALPHA VALIDATOR v3.5</h1><p>Lookahead Bias • Parameter Sensitivity (DSR) • Monte Carlo Risk</p><div class="founder-tag">Founder: Hrich Souhail</div></div>''', unsafe_allow_html=True)
 
 with st.sidebar:
     st.markdown('<div class="section">⚙️ SETTINGS</div>', unsafe_allow_html=True)
@@ -278,7 +294,7 @@ with st.sidebar:
     check_prop = st.checkbox("Prop Firm Compliance", False)
     firm = st.selectbox("Prop Firm", list(PropFirmChecker.FIRMS.keys())) if check_prop else list(PropFirmChecker.FIRMS.keys())[0]
     
-    st.markdown('<div class="section">📩 JOIN THE WAITLIST</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section">📩 JOIN WAITLIST</div>', unsafe_allow_html=True)
     with st.form("waitlist_form"):
         wl_name = st.text_input("Name", placeholder="Hrich")
         wl_email = st.text_input("Email", placeholder="hric@example.com")
@@ -296,10 +312,8 @@ tab1, tab2, tab3 = st.tabs(["📋 Code Audit", "📊 Returns & Sensitivity", "�
 with tab1:
     st.markdown('<div class="section">PASTE STRATEGY CODE</div>', unsafe_allow_html=True)
     code_input = st.text_area("Python Code", placeholder="Paste raw Python code here (no markdown)", height=280, label_visibility="collapsed")
-    
     if st.button("🔍 AUDIT CODE"):
-        if not code_input.strip():
-            st.warning("⚠️ Please paste valid Python code."); st.stop()
+        if not code_input.strip(): st.warning("⚠️ Please paste valid Python code."); st.stop()
         raw = code_input
         lines = raw.strip().split('\n')
         if lines[0].strip().startswith('```'): lines = lines[1:]
@@ -368,4 +382,4 @@ with tab3:
     <div><b style="color:#4facfe">• Monte Carlo Simulation</b><br><span style="color:#94a3b8">Resamples returns 1,000 times to estimate true Max DD & Final Equity distribution.</span></div>
     </div>''', unsafe_allow_html=True)
 
-st.markdown('''<div style="text-align:center;margin-top:40px;padding:24px;border-top:2px solid rgba(79,172,254,0.3)"><div style="font-family:'JetBrains Mono';font-size:0.85rem;color:#94a3b8;margin-bottom:8px">QUANT ALPHA v3.4 — INSTITUTIONAL GRADE</div><div style="font-size:0.8rem;color:#64748b">Founder: <b style="color:#4facfe">Hrich Souhail</b> — Not Financial Advice</div></div>''', unsafe_allow_html=True)
+st.markdown('''<div style="text-align:center;margin-top:40px;padding:24px;border-top:2px solid rgba(79,172,254,0.3)"><div style="font-family:'JetBrains Mono';font-size:0.85rem;color:#94a3b8;margin-bottom:8px">QUANT ALPHA v3.5 — INSTITUTIONAL GRADE</div><div style="font-size:0.8rem;color:#64748b">Founder: <b style="color:#4facfe">Hrich Souhail</b> — Not Financial Advice</div></div>''', unsafe_allow_html=True)
