@@ -384,7 +384,7 @@ class LogicBugDetector:
         if 'cumsum()' in code and re.search(r"Position.*=.*Signal.*cumsum", code, re.IGNORECASE):
             report.add("CRITICAL", "Logic", "Position uses cumsum() on signal", "Creates [0,1,2,3...] positions. Use: Position = Signal (1/0)")
         
-        # Fixed regex to catch flat subtraction like: df['Net'] = df['Strategy'] - 0.001
+        # ✅ FIXED: Catches flat numeric subtraction like df['Net'] = df['Strat'] - 0.001
         comm_pat = r"(Net|net|PnL|pnl|returns|result)\s*=.*-\s*(0\.00\d|0\.01|0\.1|Commission|commission|comm|cost|fee|spread)"
         if re.search(comm_pat, code, re.IGNORECASE) and not re.search(r"(commission|comm|cost|fee|spread)\s*=.*trades\s*\*", code, re.IGNORECASE):
             report.add("WARNING", "Logic", "Commission flat-subtracted from returns", "Use: Commission = trades * 0.001, then Net = Strat - Comm")
@@ -493,7 +493,7 @@ df['Signal'] = np.where(df['EMA_fast'] > df['EMA_slow'], 1, 0)
 """
     code = st.text_area("Python Code", value=sample, height=280, label_visibility="collapsed")
     if st.button("🔍 ANALYZE CODE"):
-        # ✅ FIX 1: Empty input guard
+        # ✅ FIX 1: Empty input guard prevents AST crash
         if not code.strip():
             st.info("ℹ️ Please paste some Python strategy code to analyze.")
             st.stop()
@@ -537,7 +537,7 @@ with tab2:
         raw = st.text_area("Comma-separated returns", placeholder="0.012, -0.005, 0.023, NaN, inf...", height=120, label_visibility="collapsed")
         if raw:
             try:
-                # ✅ FIX 2: Robust decimal parser
+                # ✅ FIX 2: Robust decimal parser handles NaN, Inf, and messy formatting
                 clean_vals = raw.replace('\n', ',').replace(' ', ',').split(',')
                 returns = pd.to_numeric(clean_vals, errors='coerce').dropna()
                 returns = returns[np.isfinite(returns)]
