@@ -202,36 +202,7 @@ class ValidationReport:
 # INTELLIGENT VALIDATOR MODULES
 # ─────────────────────────────────────────────────────────────
 class SmartLookaheadDetector:
-    FUTURE_KEYWORDS = ['future_', 'next_', 'forward_', 'tomorrow_', 'lead_', '_future', '_next', '_fwd', '_ahead']
     REALISTIC_ENTRY = [r"df\.iloc\[i\+\d+\]", r"entry.*=.*open", r"next_bar"]
-    
-    # NEW: Heuristics for what looks like a strategy calculation
-    STRATEGY_ASSIGNMENTS = [r"df\['(Strat|Strategy|PnL|Equity|Returns|Ret|Result)'\]", 
-                            r"df\['(Signal|Position)'\]\s*="]
-
-    class LineageVisitor(ast.NodeVisitor):
-        def __init__(self):
-            self.assignments: Dict[str, List[Tuple[int, str]]] = {}
-            self.usages: Dict[str, List[int]] = {} # Stores line numbers where used
-            self.shift_lines: set = set()
-            self.fit_lines: set = set()
-
-        def visit_Assign(self, node):
-            targets = [ast.unparse(t) for t in node.targets]
-            code = ast.unparse(node)
-            lineno = getattr(node, 'lineno', 0)
-            
-            for t in targets: 
-                self.assignments.setdefault(t, []).append((lineno, code))
-                # Check if this assignment is a shift
-                if '.shift(' in code: self.shift_lines.add(lineno)
-                if '.fit(' in code or '.fit_transform(' in code: self.fit_lines.add(lineno)
-            
-            self.generic_visit(node)
-
-        def visit_Name(self, node):
-            self.usages.setdefault(node.id, []).append(getattr(node, 'lineno', 0))
-            self.generic_visit(node)
 
     def analyze(self, code: str, report: ValidationReport):
         try: tree = ast.parse(code)
@@ -239,58 +210,47 @@ class SmartLookaheadDetector:
             report.add("CRITICAL", "Syntax", f"Cannot parse: {e}")
             return
 
-        vis = self.LineageVisitor()
-        vis.visit(tree)
+        lines = code.split('\n')
+        signal_defs = {}  # var_name -> line_index
+        shift_vars = set()
 
-        # 1. Future-named variables
-        for var, assigns in vis.assignments.items():
-            if any(kw in var.lower() for kw in self.FUTURE_KEYWORDS):
-                for ln, _ in assigns: 
-                    report.add("CRITICAL", "Lookahead", f'Variable "{var}" implies future data', "Rename to avoid lookahead implications.", ln)
-
-        # 2. Signal Indirection Fix (Context-Aware)
-        sig_vars = [v for v in vis.assignments if 'signal' in v.lower()]
-        for sv in sig_vars:
-            has_shift = any(ln in vis.shift_lines for ln, _ in vis.assignments[sv])
+        # Pass 1: Identify signal definitions and shifts
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped or stripped.startswith('#'): continue
             
-            # Check if signal is used in the code at all
-            usage_lines = vis.usages.get(sv, [])
-            is_used = len(usage_lines) > 0
-            
-            if is_used and not has_shift:
-                # If used but not shifted, check if it's used in a calculation
-                # We check if the signal variable appears in lines that look like assignments
-                suspicious_usage = False
-                for ln in usage_lines:
-                    # Look for the variable in any assignment line
-                    for target, (assign_ln, assign_code) in vis.assignments.items():
-                        if ln == assign_ln: continue # Don't count definition as usage
-                        if sv in assign_code and ('*' in assign_code or '+' in assign_code or '-' in assign_code):
-                            suspicious_usage = True
-                            break
-                
-                if suspicious_usage:
-                    report.add("WARNING", "Lookahead", 
-                        f"Signal '{sv}' used in calculation without .shift()", 
-                        "If you multiply a signal by returns without shifting, you are using same-bar data. Add .shift(1).")
-                else:
-                     # Generic warning if used but logic unclear
-                    report.add("INFO", "Lookahead", 
-                        f"Signal '{sv}' defined but shift not detected", 
-                        "Verify if this signal is applied to the correct bar.")
+            # Track shifts
+            if '.shift(' in stripped:
+                match = re.match(r'(\w+)\s*=\s*.*\.shift\(', stripped)
+                if match: shift_vars.add(match.group(1))
+                match = re.match(r'df\[(.+?)\]\s*=\s*(\w+)\.shift\(', stripped)
+                if match: shift_vars.add(match.group(2))
 
-        # 3. Data leakage via fitting
-        if vis.fit_lines and not re.search(r'train|test|split|fold|cv=', code, re.IGNORECASE):
-            for ln in vis.fit_lines: 
-                report.add("CRITICAL", "Lookahead", ".fit()/.fit_transform() on full dataset", "Splits data first. Use TimeSeriesSplit or train/test split.", ln)
+            # Detect signal generation: var = df[...] > df[...] or var = np.where(...)
+            sig_match = re.match(r'(\w+)\s*=\s*.*df\[.*\].*[><=!]+.*', stripped)
+            if sig_match:
+                var_name = sig_match.group(1)
+                signal_defs[var_name] = i
 
-        # 4. Close-price entry warning
-        if ("['Close']" in code or '["Close"]' in code) and 'open' not in code.lower():
-            report.add("WARNING", "Lookahead", "Using Close for entry — possible lookahead", "Close is unknown until bar ends. Use next bar's Open.")
+        # Pass 2: Check for unshifted multiplication with signals
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped or stripped.startswith('#'): continue
+            for sig_name, def_line in signal_defs.items():
+                if sig_name in stripped and '*' in stripped and i != def_line:
+                    if sig_name not in shift_vars and '.shift(' not in stripped:
+                        report.add("WARNING", "Lookahead",
+                            f"Signal '{sig_name}' multiplied without .shift()",
+                            f"Line {i+1}: '{stripped}'\nUsing a signal in multiplication without .shift(1) causes same-bar lookahead bias.")
+                        return
 
-        # 5. Centered rolling window
+        # Fallback: Standard AST checks for .fit() and center=True
+        if '.fit(' in code and not re.search(r'train|test|split|fold|cv=', code, re.IGNORECASE):
+            report.add("CRITICAL", "Lookahead", ".fit()/.fit_transform() on full dataset", "Splits data first. Use TimeSeriesSplit or train/test split.")
         if 'center=True' in code and 'rolling(' in code:
             report.add("CRITICAL", "Lookahead", "center=True in rolling window", "Leaks future bars. Use center=False (default) or shift results.")
+        if ("['Close']" in code or '["Close"]' in code) and 'open' not in code.lower():
+            report.add("WARNING", "Lookahead", "Using Close for entry — possible lookahead", "Close is unknown until bar ends. Use next bar's Open.")
 
 class OverfittingDetector:
     @staticmethod
@@ -299,19 +259,12 @@ class OverfittingDetector:
         ret = pd.Series(returns_tuple)
         if len(ret) < 10: return None
         m, s = ret.mean(), ret.std()
-        
-        # FIX: Handle zero variance safely
-        if s == 0:
-            sr = 0.0 
-        else:
-            sr = (m / s * np.sqrt(252))
-            
+        sr = (m / s * np.sqrt(252)) if s > 0 else 0
         T, skew, kurt = len(ret), float(ret.skew()), float(ret.kurtosis())
         try:
             var_sr = (1 + 0.5*sr**2 - skew*sr + (kurt-3)/4 * sr**2) / T
             dsr = sr / np.sqrt(max(var_sr, 1e-10))
         except: dsr = sr
-        
         cum = (1 + ret).cumprod()
         r = np.corrcoef(np.arange(len(cum)), np.log(cum.clip(1e-6)))[0,1] if len(cum)>1 else 0
         dd = (cum.cummax() - cum) / cum.cummax()
@@ -431,19 +384,15 @@ with st.sidebar:
     firm = st.selectbox("Prop Firm", list(PropFirmChecker.FIRMS.keys())) if check_prop else list(PropFirmChecker.FIRMS.keys())[0]
     st.markdown('<div class="section">🧠 INTELLIGENT DETECTIONS</div>', unsafe_allow_html=True)
     st.markdown('''<div style="font-size:0.8rem;color:#94a3b8;line-height:1.8">
-    • Context-aware AST lineage<br>• Regex math (not keywords)<br>• .fit_transform & center=True<br>• cumsum & flat-fee logic<br>• Realistic Sharpe/DD thresholds
+    • Context-aware signal tracking<br>• Regex math (not keywords)<br>• .fit_transform & center=True<br>• cumsum & flat-fee logic<br>• Realistic Sharpe/DD thresholds
     </div>''', unsafe_allow_html=True)
 
 tab1, tab2, tab3 = st.tabs(["📋 Code Analysis", "📊 Returns Analysis", "📖 How It Works"])
 
 with tab1:
     st.markdown('<div class="section">PASTE PYTHON STRATEGY CODE</div>', unsafe_allow_html=True)
-    sample = """import pandas as pd
-import numpy as np
-# Example: EMA crossover with realistic entry
-df['Signal'] = np.where(df['EMA_fast'] > df['EMA_slow'], 1, 0)
-# Uses df.iloc[i+2]['open'] for entry → no shift needed!
-"""
+    sample = """sig = (df['Close'] > df['MA20']).astype(int)
+df['Strat'] = df['Ret'] * sig"""
     code = st.text_area("Python Code", value=sample, height=280, label_visibility="collapsed")
     if st.button("🔍 ANALYZE CODE"):
         if not code.strip():
@@ -487,7 +436,6 @@ with tab2:
         raw = st.text_area("Comma-separated returns", placeholder="0.012, -0.005, 0.023, NaN, inf...", height=120, label_visibility="collapsed")
         if raw:
             try:
-                # ✅ ROBUST PARSER: Handles strings, NaN, Inf, spaces, newlines
                 clean_vals = raw.replace('\n', ',').replace(' ', ',').split(',')
                 returns = pd.Series(pd.to_numeric(clean_vals, errors='coerce')).dropna()
                 returns = returns[np.isfinite(returns)]
@@ -503,8 +451,6 @@ with tab2:
         with st.spinner("Computing statistics & prop rules..."):
             code_ctx = code if st.checkbox("Also check code from Tab 1", False) else ""
             rpt = run_validation(code_ctx, returns, n_trials, check_prop, firm)
-            
-            # ✅ DYNAMIC EQUITY & DRAWDOWN (Never assumes columns exist)
             equity = INITIAL_CAPITAL * (1 + returns).cumprod()
             peak = equity.cummax()
             drawdown = (equity - peak) / peak
@@ -514,26 +460,22 @@ with tab2:
         with c1:
             st.markdown(f"""<div class="score-card {score_style(rpt.score)}"><div class="score-number">{rpt.score}</div><div class="score-label">REALISM SCORE / 100</div><div style="margin-top:10px;font-weight:700;font-size:1.1rem">{rpt.verdict}</div></div>""", unsafe_allow_html=True)
             st.markdown(f"""<div class="metric-box"><div class="metric-val">{max_dd:.2f}%</div><div class="metric-lbl">Max Drawdown</div></div>""", unsafe_allow_html=True)
-            
         with c2:
             st.markdown('<div class="section">KEY METRICS</div>', unsafe_allow_html=True)
             cols = st.columns(3)
             for i,(k,v) in enumerate(rpt.metrics.items()):
                 with cols[i%3]: st.markdown(f"""<div class="metric-box"><div class="metric-val">{v}</div><div class="metric-lbl">{k}</div></div>""", unsafe_allow_html=True)
-                
         st.markdown('<div class="section">EQUITY CURVE</div>', unsafe_allow_html=True)
         st.line_chart(equity, height=300)
-        
         st.markdown('<div class="section">FINDINGS</div>', unsafe_allow_html=True)
         for iss in rpt.issues: render_issue(iss)
-        
         st.download_button("⬇️ Download Report JSON", json.dumps({'score':rpt.score, 'metrics':rpt.metrics, 'max_dd': max_dd, 'issues': [{'s':i.severity,'c':i.category,'m':i.message} for i in rpt.issues]}, indent=2), "validation_report.json", "application/json")
 
 with tab3:
     st.markdown('<div class="section">🧠 INTELLIGENCE UPGRADES</div>', unsafe_allow_html=True)
     st.markdown('''
     <div style="background:rgba(17,24,39,0.6);border-radius:12px;padding:24px;margin:16px 0">
-    <div style="margin-bottom:16px"><b style="color:#38bdf8">• Context-Aware AST</b><br><span style="color:#94a3b8">Tracks `Signal` → `Returns` flow. Ignores false positives if `i+1/i+2` entry is used.</span></div>
+    <div style="margin-bottom:16px"><b style="color:#38bdf8">• Context-Aware Signal Tracking</b><br><span style="color:#94a3b8">Catches indirect lookahead like `sig = df[...] > df[...]` used in `df['Strat'] = df['Ret'] * sig` without .shift()</span></div>
     <div style="margin-bottom:16px"><b style="color:#38bdf8">• Regex Math Detection</b><br><span style="color:#94a3b8">Scans `commission\s*=` or `*\s*0.\d+`. Stops flagging comments.</span></div>
     <div style="margin-bottom:16px"><b style="color:#38bdf8">• Fixed Deflated Sharpe</b><br><span style="color:#94a3b8">Correct Bailey & López de Prado formula. No more 300k+ values.</span></div>
     <div style="margin-bottom:16px"><b style="color:#38bdf8">• Logic Bug Catcher</b><br><span style="color:#94a3b8">Flags `cumsum()` on binary signals, flat fee math, `center=True` rolling windows.</span></div>
