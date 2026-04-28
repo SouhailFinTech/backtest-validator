@@ -1,13 +1,14 @@
 """
 ╔══════════════════════════════════════════════════════╗
-║     QUANT ALPHA — INSTITUTIONAL VALIDATOR v3.2       ║
+║     QUANT ALPHA — INSTITUTIONAL VALIDATOR v3.3       ║
 ║     Founder: Hrich Souhail                           ║
-║   Fixes: NumPy dropna crash, Markdown paste artifacts, State persistence ║
+║   Fixes: DSR n_trials=1 edge case, NumPy dropna,     ║
+║          Markdown paste artifacts, State persistence ║
 ║   Streamlit App — Production Ready                   ║
 ╚══════════════════════════════════════════════════════╝
 
 Install:  pip install streamlit pandas numpy scipy
-Run:      streamlit run quant_alpha_v3.2.py
+Run:      streamlit run quant_alpha_v3.3.py
 Deploy:   streamlit.io (free)
 """
 
@@ -156,7 +157,11 @@ class OverfittingDetector:
         T, skew, kurt = len(ret), float(ret.skew()), float(ret.kurtosis())
         try:
             var_sr = (1 + 0.5*sr**2 - skew*sr + (kurt-3)/4 * sr**2) / T
-            dsr = sr / (np.sqrt(var_sr) * np.sqrt(np.log(n_trials))) if n_trials > 1 else sr / np.sqrt(var_sr)
+            # 🔧 FIX: DSR n_trials=1 edge case + zero-variance protection
+            if n_trials <= 1:
+                dsr = sr / np.sqrt(max(var_sr, 1e-10))
+            else:
+                dsr = sr / (np.sqrt(max(var_sr, 1e-10)) * np.sqrt(np.log(n_trials)))
         except: dsr = sr
         cum = (1 + ret).cumprod()
         r = np.corrcoef(np.arange(len(cum)), np.log(cum.clip(1e-6)))[0,1] if len(cum)>1 else 0
@@ -248,7 +253,7 @@ def score_style(s): return 'score-great' if s>=80 else 'score-ok' if s>=55 else 
 # ─────────────────────────────────────────────────────────────
 # MAIN APP
 # ─────────────────────────────────────────────────────────────
-st.markdown('''<div class="header-box"><h1>🔬 QUANT ALPHA VALIDATOR v3.2</h1><p>Lookahead Bias • Parameter Sensitivity (DSR) • Monte Carlo Risk</p><div class="founder-tag">Founder: Hrich Souhail</div></div>''', unsafe_allow_html=True)
+st.markdown('''<div class="header-box"><h1>🔬 QUANT ALPHA VALIDATOR v3.3</h1><p>Lookahead Bias • Parameter Sensitivity (DSR) • Monte Carlo Risk</p><div class="founder-tag">Founder: Hrich Souhail</div></div>''', unsafe_allow_html=True)
 
 with st.sidebar:
     st.markdown('<div class="section">⚙️ SETTINGS</div>', unsafe_allow_html=True)
@@ -268,11 +273,9 @@ with tab1:
             
         # ✅ ROBUST CODE CLEANING
         raw = code_input
-        # Strip markdown fences
         lines = raw.strip().split('\n')
         if lines[0].strip().startswith('```'): lines = lines[1:]
         if lines and lines[-1].strip().startswith('```'): lines = lines[:-1]
-        # Remove invisible Unicode/control chars
         clean_lines = ["".join(ch for ch in line if unicodedata.category(ch)[0] != 'C') for line in lines]
         cleaned_code = '\n'.join(clean_lines).strip()
         
@@ -299,15 +302,14 @@ with tab2:
     
     if raw_returns:
         try:
-            # ✅ ROBUST PARSER: Handles commas, spaces, newlines, tabs, semicolons
-            clean = re.sub(r'[^0-9.,\-\s]', '', raw_returns) # Keep only numbers, dots, commas, minus, whitespace
+            clean = re.sub(r'[^0-9.,\-\s]', '', raw_returns)
             parts = re.split(r'[,\s]+', clean.strip())
             parts = [p for p in parts if p]
             
             # ✅ FIX: Wrap in pd.Series BEFORE .dropna() to avoid NumPy error
             numeric = pd.to_numeric(parts, errors='coerce')
             parsed = pd.Series(numeric).dropna()
-            parsed = parsed[np.isfinite(parsed)] # Remove inf/-inf
+            parsed = parsed[np.isfinite(parsed)]
             
             if len(parsed) >= 10:
                 st.session_state.parsed_returns = parsed
@@ -352,4 +354,4 @@ with tab3:
     <div><b style="color:#4facfe">• Monte Carlo Simulation</b><br><span style="color:#94a3b8">Resamples returns 1,000 times to estimate true Max DD & Final Equity distribution.</span></div>
     </div>''', unsafe_allow_html=True)
 
-st.markdown('''<div style="text-align:center;margin-top:40px;padding:24px;border-top:2px solid rgba(79,172,254,0.3)"><div style="font-family:'JetBrains Mono';font-size:0.85rem;color:#94a3b8;margin-bottom:8px">QUANT ALPHA v3.2 — INSTITUTIONAL GRADE</div><div style="font-size:0.8rem;color:#64748b">Founder: <b style="color:#4facfe">Hrich Souhail</b> — Not Financial Advice</div></div>''', unsafe_allow_html=True)
+st.markdown('''<div style="text-align:center;margin-top:40px;padding:24px;border-top:2px solid rgba(79,172,254,0.3)"><div style="font-family:'JetBrains Mono';font-size:0.85rem;color:#94a3b8;margin-bottom:8px">QUANT ALPHA v3.3 — INSTITUTIONAL GRADE</div><div style="font-size:0.8rem;color:#64748b">Founder: <b style="color:#4facfe">Hrich Souhail</b> — Not Financial Advice</div></div>''', unsafe_allow_html=True)
