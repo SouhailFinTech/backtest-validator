@@ -1,20 +1,21 @@
 """
 ╔══════════════════════════════════════════════════════╗
-║     QUANT ALPHA — INSTITUTIONAL VALIDATOR v3.3       ║
+║     QUANT ALPHA — INSTITUTIONAL VALIDATOR v3.4       ║
 ║     Founder: Hrich Souhail                           ║
-║   Fixes: DSR n_trials=1 edge case, NumPy dropna,     ║
-║          Markdown paste artifacts, State persistence ║
+║   Fixes: DSR explosion, NumPy dropna, State persist  ║
+║   Features: Monte Carlo, DSR, Waitlist Integration   ║
 ║   Streamlit App — Production Ready                   ║
 ╚══════════════════════════════════════════════════════╝
 
 Install:  pip install streamlit pandas numpy scipy
-Run:      streamlit run quant_alpha_v3.3.py
+Run:      streamlit run quant_alpha_v3.4.py
 Deploy:   streamlit.io (free)
 """
 
 import sys
 import re
 import json
+import os
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -41,6 +42,7 @@ st.set_page_config(page_title="Quant Alpha | Institutional Validator", page_icon
 # ─────────────────────────────────────────────────────────────
 if 'parsed_returns' not in st.session_state: st.session_state.parsed_returns = None
 if 'last_code' not in st.session_state: st.session_state.last_code = ""
+if 'waitlist_signed' not in st.session_state: st.session_state.waitlist_signed = False
 
 # ─────────────────────────────────────────────────────────────
 # UI THEME
@@ -74,6 +76,7 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; background: linea
 .issue-warning  { background: rgba(225, 112, 85, 0.15); border-left-color: #fdcb6e; }
 .issue-info     { background: rgba(79, 172, 254, 0.15); border-left-color: #4facfe; }
 .issue-ok       { background: rgba(0, 184, 148, 0.15); border-left-color: #55efc4; }
+.waitlist-box { background: rgba(15, 23, 42, 0.6); border: 1px solid rgba(79, 172, 254, 0.3); border-radius: 12px; padding: 16px; margin-top: 20px; }
 #MainMenu, footer, header { visibility: hidden; }
 </style>
 """, unsafe_allow_html=True)
@@ -155,14 +158,19 @@ class OverfittingDetector:
         m, s = ret.mean(), ret.std()
         sr = (m / s * np.sqrt(252)) if s > 0 else 0
         T, skew, kurt = len(ret), float(ret.skew()), float(ret.kurtosis())
+        
+        # 🔧 ROBUST DSR FIX: Prevents explosion & division-by-zero
         try:
             var_sr = (1 + 0.5*sr**2 - skew*sr + (kurt-3)/4 * sr**2) / T
-            # 🔧 FIX: DSR n_trials=1 edge case + zero-variance protection
+            var_sr = max(var_sr, 1e-6)  # Floor variance
             if n_trials <= 1:
-                dsr = sr / np.sqrt(max(var_sr, 1e-10))
+                dsr = sr / np.sqrt(var_sr)
             else:
-                dsr = sr / (np.sqrt(max(var_sr, 1e-10)) * np.sqrt(np.log(n_trials)))
-        except: dsr = sr
+                dsr = sr / (np.sqrt(var_sr) * np.sqrt(np.log(n_trials) + 1e-10))
+            dsr = np.clip(dsr, -10, 10)  # Cap explosive values
+        except:
+            dsr = sr if s > 0 else 0  # Safe fallback
+            
         cum = (1 + ret).cumprod()
         r = np.corrcoef(np.arange(len(cum)), np.log(cum.clip(1e-6)))[0,1] if len(cum)>1 else 0
         dd = (cum.cummax() - cum) / cum.cummax()
@@ -251,15 +259,37 @@ def render_issue(issue: Issue):
 def score_style(s): return 'score-great' if s>=80 else 'score-ok' if s>=55 else 'score-bad'
 
 # ─────────────────────────────────────────────────────────────
+# WAITLIST HANDLER
+# ─────────────────────────────────────────────────────────────
+def save_to_waitlist(email, name, role):
+    os.makedirs("data", exist_ok=True)
+    df = pd.DataFrame([{"name": name, "email": email, "role": role, "timestamp": pd.Timestamp.now()}])
+    path = "data/waitlist.csv"
+    df.to_csv(path, mode="a", header=not os.path.exists(path), index=False)
+
+# ─────────────────────────────────────────────────────────────
 # MAIN APP
 # ─────────────────────────────────────────────────────────────
-st.markdown('''<div class="header-box"><h1>🔬 QUANT ALPHA VALIDATOR v3.3</h1><p>Lookahead Bias • Parameter Sensitivity (DSR) • Monte Carlo Risk</p><div class="founder-tag">Founder: Hrich Souhail</div></div>''', unsafe_allow_html=True)
+st.markdown('''<div class="header-box"><h1>🔬 QUANT ALPHA VALIDATOR v3.4</h1><p>Lookahead Bias • Parameter Sensitivity (DSR) • Monte Carlo Risk</p><div class="founder-tag">Founder: Hrich Souhail</div></div>''', unsafe_allow_html=True)
 
 with st.sidebar:
     st.markdown('<div class="section">⚙️ SETTINGS</div>', unsafe_allow_html=True)
     n_trials = st.slider("Parameter Trials Tested", 1, 500, 1, help="Crucial for DSR. Set to how many combos you tested.")
     check_prop = st.checkbox("Prop Firm Compliance", False)
     firm = st.selectbox("Prop Firm", list(PropFirmChecker.FIRMS.keys())) if check_prop else list(PropFirmChecker.FIRMS.keys())[0]
+    
+    st.markdown('<div class="section">📩 JOIN THE WAITLIST</div>', unsafe_allow_html=True)
+    with st.form("waitlist_form"):
+        wl_name = st.text_input("Name", placeholder="Hrich")
+        wl_email = st.text_input("Email", placeholder="hric@example.com")
+        wl_role = st.selectbox("Role", ["Retail Trader", "Prop Fund Manager", "Quant Developer", "Institutional"])
+        submitted = st.form_submit_button("🚀 Get Early Access")
+        if submitted and wl_email and "@" in wl_email:
+            save_to_waitlist(wl_email, wl_name, wl_role)
+            st.session_state.waitlist_signed = True
+            st.success("✅ You're on the list! We'll notify you at launch.")
+        elif submitted:
+            st.error("⚠️ Please enter a valid email.")
 
 tab1, tab2, tab3 = st.tabs(["📋 Code Audit", "📊 Returns & Sensitivity", "📖 Methodology"])
 
@@ -270,23 +300,16 @@ with tab1:
     if st.button("🔍 AUDIT CODE"):
         if not code_input.strip():
             st.warning("⚠️ Please paste valid Python code."); st.stop()
-            
-        # ✅ ROBUST CODE CLEANING
         raw = code_input
         lines = raw.strip().split('\n')
         if lines[0].strip().startswith('```'): lines = lines[1:]
         if lines and lines[-1].strip().startswith('```'): lines = lines[:-1]
         clean_lines = ["".join(ch for ch in line if unicodedata.category(ch)[0] != 'C') for line in lines]
         cleaned_code = '\n'.join(clean_lines).strip()
-        
-        if not cleaned_code:
-            st.warning("⚠️ Empty code after cleaning."); st.stop()
-            
+        if not cleaned_code: st.warning("⚠️ Empty code after cleaning."); st.stop()
         st.session_state.last_code = cleaned_code
-        
         with st.spinner("Analyzing AST & Logic..."):
             rpt = run_validation(cleaned_code, None, n_trials, False, firm)
-            
         c1, c2 = st.columns([1,2])
         with c1:
             st.markdown(f"""<div class="score-card {score_style(rpt.score)}"><div class="score-number">{rpt.score}</div><div class="score-label">REALISM SCORE / 100</div><div style="margin-top:10px;font-weight:700">{rpt.verdict}</div></div>""", unsafe_allow_html=True)
@@ -299,39 +322,30 @@ with tab1:
 with tab2:
     st.markdown('<div class="section">RETURN ANALYSIS & SENSITIVITY</div>', unsafe_allow_html=True)
     raw_returns = st.text_area("Paste Returns (comma/space/newline separated)", placeholder="0.01, -0.02, 0.05, 0.012...", height=120, label_visibility="collapsed")
-    
     if raw_returns:
         try:
             clean = re.sub(r'[^0-9.,\-\s]', '', raw_returns)
             parts = re.split(r'[,\s]+', clean.strip())
             parts = [p for p in parts if p]
-            
-            # ✅ FIX: Wrap in pd.Series BEFORE .dropna() to avoid NumPy error
             numeric = pd.to_numeric(parts, errors='coerce')
             parsed = pd.Series(numeric).dropna()
             parsed = parsed[np.isfinite(parsed)]
-            
             if len(parsed) >= 10:
                 st.session_state.parsed_returns = parsed
                 st.success(f"✅ Loaded {len(parsed)} valid returns")
             else:
                 st.warning(f"⚠️ Only {len(parsed)} valid returns found. Need ≥10.")
                 st.session_state.parsed_returns = parsed
-        except Exception as e:
-            st.error(f"Parse error: {e}")
+        except Exception as e: st.error(f"Parse error: {e}")
             
     if st.button("📊 RUN SENSITIVITY ANALYSIS"):
         returns = st.session_state.parsed_returns
-        if returns is None or len(returns) < 10:
-            st.warning("⚠️ Need ≥10 valid returns. Paste data first.")
-            st.stop()
-            
+        if returns is None or len(returns) < 10: st.warning("⚠️ Need ≥10 valid returns. Paste data first."); st.stop()
         with st.spinner("Running Monte Carlo & DSR..."):
             rpt = run_validation("", returns, n_trials, check_prop, firm)
             mc = run_monte_carlo(returns)
             equity = INITIAL_CAPITAL * (1 + returns).cumprod()
             max_dd = float(((equity - equity.cummax()) / equity.cummax()).min()) * 100
-            
         c1, c2 = st.columns([1,2])
         with c1:
             st.markdown(f"""<div class="score-card {score_style(rpt.score)}"><div class="score-number">{rpt.score}</div><div class="score-label">REALISM SCORE / 100</div><div style="margin-top:10px;font-weight:700">{rpt.verdict}</div></div>""", unsafe_allow_html=True)
@@ -354,4 +368,4 @@ with tab3:
     <div><b style="color:#4facfe">• Monte Carlo Simulation</b><br><span style="color:#94a3b8">Resamples returns 1,000 times to estimate true Max DD & Final Equity distribution.</span></div>
     </div>''', unsafe_allow_html=True)
 
-st.markdown('''<div style="text-align:center;margin-top:40px;padding:24px;border-top:2px solid rgba(79,172,254,0.3)"><div style="font-family:'JetBrains Mono';font-size:0.85rem;color:#94a3b8;margin-bottom:8px">QUANT ALPHA v3.3 — INSTITUTIONAL GRADE</div><div style="font-size:0.8rem;color:#64748b">Founder: <b style="color:#4facfe">Hrich Souhail</b> — Not Financial Advice</div></div>''', unsafe_allow_html=True)
+st.markdown('''<div style="text-align:center;margin-top:40px;padding:24px;border-top:2px solid rgba(79,172,254,0.3)"><div style="font-family:'JetBrains Mono';font-size:0.85rem;color:#94a3b8;margin-bottom:8px">QUANT ALPHA v3.4 — INSTITUTIONAL GRADE</div><div style="font-size:0.8rem;color:#64748b">Founder: <b style="color:#4facfe">Hrich Souhail</b> — Not Financial Advice</div></div>''', unsafe_allow_html=True)
