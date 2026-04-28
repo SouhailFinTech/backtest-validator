@@ -204,11 +204,15 @@ class ValidationReport:
 class SmartLookaheadDetector:
     FUTURE_KEYWORDS = ['future_', 'next_', 'forward_', 'tomorrow_', 'lead_', '_future', '_next', '_fwd', '_ahead']
     REALISTIC_ENTRY = [r"df\.iloc\[i\+\d+\]", r"entry.*=.*open", r"next_bar"]
+    
+    # NEW: Heuristics for what looks like a strategy calculation
+    STRATEGY_ASSIGNMENTS = [r"df\['(Strat|Strategy|PnL|Equity|Returns|Ret|Result)'\]", 
+                            r"df\['(Signal|Position)'\]\s*="]
 
     class LineageVisitor(ast.NodeVisitor):
         def __init__(self):
             self.assignments: Dict[str, List[Tuple[int, str]]] = {}
-            self.usages: Dict[str, List[Tuple[int, str]]] = {}
+            self.usages: Dict[str, List[int]] = {} # Stores line numbers where used
             self.shift_lines: set = set()
             self.fit_lines: set = set()
 
@@ -216,13 +220,17 @@ class SmartLookaheadDetector:
             targets = [ast.unparse(t) for t in node.targets]
             code = ast.unparse(node)
             lineno = getattr(node, 'lineno', 0)
-            for t in targets: self.assignments.setdefault(t, []).append((lineno, code))
-            if '.shift(' in code: self.shift_lines.add(lineno)
-            if '.fit(' in code or '.fit_transform(' in code: self.fit_lines.add(lineno)
+            
+            for t in targets: 
+                self.assignments.setdefault(t, []).append((lineno, code))
+                # Check if this assignment is a shift
+                if '.shift(' in code: self.shift_lines.add(lineno)
+                if '.fit(' in code or '.fit_transform(' in code: self.fit_lines.add(lineno)
+            
             self.generic_visit(node)
 
         def visit_Name(self, node):
-            self.usages.setdefault(node.id, []).append((getattr(node, 'lineno', 0), node.id))
+            self.usages.setdefault(node.id, []).append(getattr(node, 'lineno', 0))
             self.generic_visit(node)
 
     def analyze(self, code: str, report: ValidationReport):
@@ -234,27 +242,53 @@ class SmartLookaheadDetector:
         vis = self.LineageVisitor()
         vis.visit(tree)
 
+        # 1. Future-named variables
         for var, assigns in vis.assignments.items():
             if any(kw in var.lower() for kw in self.FUTURE_KEYWORDS):
-                for ln, _ in assigns: report.add("CRITICAL", "Lookahead", f'Variable "{var}" implies future data', "Rename to avoid lookahead implications.", ln)
+                for ln, _ in assigns: 
+                    report.add("CRITICAL", "Lookahead", f'Variable "{var}" implies future data', "Rename to avoid lookahead implications.", ln)
 
+        # 2. Signal Indirection Fix (Context-Aware)
         sig_vars = [v for v in vis.assignments if 'signal' in v.lower()]
         for sv in sig_vars:
-            used_in_pnl = any(kw in " ".join(c for _, c in vis.usages.get(sv, [])).lower() for kw in ['return', 'pnl', 'profit', 'strategy'])
-            if not used_in_pnl: continue
             has_shift = any(ln in vis.shift_lines for ln, _ in vis.assignments[sv])
-            if has_shift: report.add("OK", "Lookahead", f"Signal '{sv}' properly offset with .shift()", "Entry uses previous bar's signal. ✓")
-            elif any(re.search(p, code, re.IGNORECASE) for p in self.REALISTIC_ENTRY):
-                report.add("OK", "Lookahead", f"Signal '{sv}' used with realistic execution (i+N/next_bar)", "Future-bar entry enforces safety. ✓")
-            else:
-                report.add("WARNING", "Lookahead", f"Signal '{sv}' used in PnL without .shift() or future entry", "Same-bar signal × return leaks data. Add .shift(1) or use df.iloc[i+1]['open'].")
+            
+            # Check if signal is used in the code at all
+            usage_lines = vis.usages.get(sv, [])
+            is_used = len(usage_lines) > 0
+            
+            if is_used and not has_shift:
+                # If used but not shifted, check if it's used in a calculation
+                # We check if the signal variable appears in lines that look like assignments
+                suspicious_usage = False
+                for ln in usage_lines:
+                    # Look for the variable in any assignment line
+                    for target, (assign_ln, assign_code) in vis.assignments.items():
+                        if ln == assign_ln: continue # Don't count definition as usage
+                        if sv in assign_code and ('*' in assign_code or '+' in assign_code or '-' in assign_code):
+                            suspicious_usage = True
+                            break
+                
+                if suspicious_usage:
+                    report.add("WARNING", "Lookahead", 
+                        f"Signal '{sv}' used in calculation without .shift()", 
+                        "If you multiply a signal by returns without shifting, you are using same-bar data. Add .shift(1).")
+                else:
+                     # Generic warning if used but logic unclear
+                    report.add("INFO", "Lookahead", 
+                        f"Signal '{sv}' defined but shift not detected", 
+                        "Verify if this signal is applied to the correct bar.")
 
+        # 3. Data leakage via fitting
         if vis.fit_lines and not re.search(r'train|test|split|fold|cv=', code, re.IGNORECASE):
-            for ln in vis.fit_lines: report.add("CRITICAL", "Lookahead", ".fit()/.fit_transform() on full dataset", "Splits data first. Use TimeSeriesSplit or train/test split.", ln)
+            for ln in vis.fit_lines: 
+                report.add("CRITICAL", "Lookahead", ".fit()/.fit_transform() on full dataset", "Splits data first. Use TimeSeriesSplit or train/test split.", ln)
 
+        # 4. Close-price entry warning
         if ("['Close']" in code or '["Close"]' in code) and 'open' not in code.lower():
             report.add("WARNING", "Lookahead", "Using Close for entry — possible lookahead", "Close is unknown until bar ends. Use next bar's Open.")
 
+        # 5. Centered rolling window
         if 'center=True' in code and 'rolling(' in code:
             report.add("CRITICAL", "Lookahead", "center=True in rolling window", "Leaks future bars. Use center=False (default) or shift results.")
 
@@ -265,12 +299,19 @@ class OverfittingDetector:
         ret = pd.Series(returns_tuple)
         if len(ret) < 10: return None
         m, s = ret.mean(), ret.std()
-        sr = (m / s * np.sqrt(252)) if s > 0 else 0
+        
+        # FIX: Handle zero variance safely
+        if s == 0:
+            sr = 0.0 
+        else:
+            sr = (m / s * np.sqrt(252))
+            
         T, skew, kurt = len(ret), float(ret.skew()), float(ret.kurtosis())
         try:
             var_sr = (1 + 0.5*sr**2 - skew*sr + (kurt-3)/4 * sr**2) / T
             dsr = sr / np.sqrt(max(var_sr, 1e-10))
         except: dsr = sr
+        
         cum = (1 + ret).cumprod()
         r = np.corrcoef(np.arange(len(cum)), np.log(cum.clip(1e-6)))[0,1] if len(cum)>1 else 0
         dd = (cum.cummax() - cum) / cum.cummax()
